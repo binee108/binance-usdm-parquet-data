@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-import polars as pl
+import duckdb
 
-from binance_usdm_parquet_data.parquet_storage import normalize_kline_frame
+from binance_usdm_parquet_data.storage_keys import symbol_storage_key
 
 
 def optimize_klines(
@@ -17,39 +18,62 @@ def optimize_klines(
     if not raw_files:
         msg = "raw_files must not be empty"
         raise ValueError(msg)
-    frames = [normalize_kline_frame(pl.read_parquet(path)) for path in raw_files]
-    merged = pl.concat(frames).sort("open_time")
-    optimized = _resample(merged, interval)
     output = (
-        output_root / "klines" / f"symbol={symbol}" / f"interval={interval}" / "candles.parquet"
+        output_root
+        / "klines"
+        / f"symbol={symbol_storage_key(symbol)}"
+        / f"interval={interval}"
+        / "candles.parquet"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    optimized.write_parquet(output)
+    with NamedTemporaryFile(suffix=".parquet", dir=output.parent, delete=False) as handle:
+        temp_path = Path(handle.name)
+    interval_ms = _interval_ms(interval)
+    file_paths = [path.as_posix() for path in raw_files]
+    with duckdb.connect(":memory:") as connection:
+        query = _optimized_query()
+        params = [file_paths, interval_ms, interval_ms]
+        relation = connection.sql(query, params=params)
+        relation.write_parquet(temp_path.as_posix(), compression="zstd")
+    _ = temp_path.replace(output)
     return output
 
 
-def _resample(frame: pl.DataFrame, interval: str) -> pl.DataFrame:
-    interval_ms = _interval_ms(interval)
-    with_bucket = frame.with_columns(
-        ((pl.col("open_time").dt.epoch("ms") // interval_ms) * interval_ms).alias("bucket_ms")
-    )
+def _optimized_query() -> str:
     return (
-        with_bucket.group_by("bucket_ms", maintain_order=True)
-        .agg(
-            pl.col("open").first(),
-            pl.col("high").max(),
-            pl.col("low").min(),
-            pl.col("close").last(),
-            pl.col("volume").sum(),
-            pl.col("trade_count").sum(),
-        )
-        .with_columns(
-            pl.from_epoch(pl.col("bucket_ms"), time_unit="ms")
-            .dt.replace_time_zone("UTC")
-            .cast(pl.Datetime(time_unit="ms", time_zone="UTC"))
-            .alias("open_time")
-        )
-        .select("open_time", "open", "high", "low", "close", "volume", "trade_count")
+        "WITH normalized AS ("
+        "SELECT "
+        "coalesce(epoch_ms(try_cast(open_time AS TIMESTAMP)), try_cast(open_time AS BIGINT)) "
+        "AS open_time_ms, "
+        "try_cast(open AS DOUBLE) AS open, "
+        "try_cast(high AS DOUBLE) AS high, "
+        "try_cast(low AS DOUBLE) AS low, "
+        "try_cast(close AS DOUBLE) AS close, "
+        "try_cast(volume AS DOUBLE) AS volume, "
+        "try_cast(COLUMNS('^(trade_count|number_of_trades)$') AS BIGINT) AS trade_count "
+        "FROM read_parquet(?)"
+        "), bucketed AS ("
+        "SELECT *, floor(open_time_ms / ?) * ? AS bucket_ms "
+        "FROM normalized "
+        "WHERE open_time_ms IS NOT NULL "
+        "AND open IS NOT NULL "
+        "AND high IS NOT NULL "
+        "AND low IS NOT NULL "
+        "AND close IS NOT NULL "
+        "AND volume IS NOT NULL "
+        "AND trade_count IS NOT NULL"
+        ") "
+        "SELECT "
+        "to_timestamp(cast(bucket_ms AS DOUBLE) / 1000.0) AS open_time, "
+        "arg_min(open, open_time_ms) AS open, "
+        "max(high) AS high, "
+        "min(low) AS low, "
+        "arg_max(close, open_time_ms) AS close, "
+        "sum(volume) AS volume, "
+        "cast(sum(trade_count) AS BIGINT) AS trade_count "
+        "FROM bucketed "
+        "GROUP BY bucket_ms "
+        "ORDER BY bucket_ms"
     )
 
 

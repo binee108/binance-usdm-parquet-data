@@ -12,6 +12,7 @@ from typing import Protocol
 import polars as pl
 
 from binance_usdm_parquet_data.parquet_storage import normalize_kline_frame
+from binance_usdm_parquet_data.storage_keys import symbol_storage_key
 
 SHA256_HEX_LENGTH = 64
 
@@ -28,6 +29,15 @@ class DailyArchiveRequest:
     symbol: str
     interval: str
     day: date
+    base_url: str = "https://data.binance.vision"
+
+
+@dataclass(frozen=True, slots=True)
+class MonthlyArchiveRequest:
+    dataset: str
+    symbol: str
+    interval: str
+    month: str
     base_url: str = "https://data.binance.vision"
 
 
@@ -75,12 +85,51 @@ def download_daily_archive_to_parquet(
     )
 
 
+def download_monthly_archive_to_parquet(
+    client: ArchiveHttpClient,
+    request: MonthlyArchiveRequest,
+    root: Path,
+) -> DownloadedArchiveFile | ArchiveDownloadFailure:
+    source_url = _monthly_zip_url(request)
+    checksum_text = client.get_text(f"{source_url}.CHECKSUM")
+    archive_bytes = client.get_bytes(source_url)
+    expected_checksum = _parse_checksum(checksum_text)
+    actual_checksum = hashlib.sha256(archive_bytes).hexdigest()
+    if actual_checksum != expected_checksum:
+        return ArchiveDownloadFailure(
+            source_url=source_url,
+            error_code="checksum_mismatch",
+            error_message=f"expected {expected_checksum} got {actual_checksum}",
+            retryable=True,
+        )
+    frame = _archive_zip_to_kline_frame(archive_bytes)
+    output_path = _monthly_parquet_path(root, request)
+    _atomic_write_parquet(output_path, frame)
+    return DownloadedArchiveFile(
+        source_url=source_url,
+        output_path=output_path,
+        checksum=actual_checksum,
+        row_count=frame.height,
+    )
+
+
 def _daily_zip_url(request: DailyArchiveRequest) -> str:
     dataset_path = _dataset_archive_path(request.dataset)
-    filename = f"{request.symbol}-{request.interval}-{request.day.isoformat()}.zip"
+    remote_symbol = symbol_storage_key(request.symbol)
+    filename = f"{remote_symbol}-{request.interval}-{request.day.isoformat()}.zip"
     return (
         f"{request.base_url.rstrip('/')}/data/futures/um/daily/{dataset_path}/"
-        f"{request.symbol}/{request.interval}/{filename}"
+        f"{remote_symbol}/{request.interval}/{filename}"
+    )
+
+
+def _monthly_zip_url(request: MonthlyArchiveRequest) -> str:
+    dataset_path = _dataset_archive_path(request.dataset)
+    remote_symbol = symbol_storage_key(request.symbol)
+    filename = f"{remote_symbol}-{request.interval}-{request.month}.zip"
+    return (
+        f"{request.base_url.rstrip('/')}/data/futures/um/monthly/{dataset_path}/"
+        f"{remote_symbol}/{request.interval}/{filename}"
     )
 
 
@@ -98,10 +147,19 @@ def _dataset_archive_path(dataset: str) -> str:
 def _daily_parquet_path(root: Path, request: DailyArchiveRequest) -> Path:
     dataset_dir = "klines" if request.dataset == "klines" else "premiumIndexKlines"
     dataset_name = "klines" if request.dataset == "klines" else "premiumIndexKlines"
+    storage_key = symbol_storage_key(request.symbol)
     filename = (
-        f"{request.symbol}_{dataset_name}_{request.interval}_{request.day.isoformat()}.parquet"
+        f"{storage_key}_{dataset_name}_{request.interval}_{request.day.isoformat()}.parquet"
     )
-    return root / "binance" / "futures" / dataset_dir / request.symbol / filename
+    return root / "binance" / "futures" / dataset_dir / storage_key / filename
+
+
+def _monthly_parquet_path(root: Path, request: MonthlyArchiveRequest) -> Path:
+    dataset_dir = "klines" if request.dataset == "klines" else "premiumIndexKlines"
+    dataset_name = "klines" if request.dataset == "klines" else "premiumIndexKlines"
+    storage_key = symbol_storage_key(request.symbol)
+    filename = f"{storage_key}_{dataset_name}_{request.interval}_{request.month}.parquet"
+    return root / "binance" / "futures" / dataset_dir / storage_key / filename
 
 
 def _parse_checksum(text: str) -> str:

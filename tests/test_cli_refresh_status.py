@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import polars as pl
 from typer.testing import CliRunner
 
 from binance_usdm_parquet_data import cli
@@ -162,3 +163,96 @@ def test_refresh_all_discovers_usdt_symbols_before_refresh(
 
     assert result.exit_code == 0
     assert captured_symbols == [("BTCUSDT", "DELISTEDUSDT")]
+
+
+def test_refresh_command_passes_archive_granularity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_granularity: list[str] = []
+    monkeypatch.setattr(cli, "Httpx2SyncClient", FakeArchiveClient)
+    monkeypatch.setattr(cli, "BinanceFundingRateClient", fake_funding_client)
+
+    def fake_refresh_market_data(
+        request: RefreshRequest,
+        *,
+        archive_client: ArchiveHttpClient,
+        funding_client: FundingRateClient,
+    ) -> RefreshResult:
+        _ = (archive_client, funding_client)
+        captured_granularity.append(request.archive_granularity)
+        return RefreshResult(
+            run_id="run-monthly",
+            status="succeeded",
+            success_count=0,
+            failure_count=0,
+        )
+
+    monkeypatch.setattr(cli, "refresh_market_data", fake_refresh_market_data)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "refresh",
+            "--root",
+            str(tmp_path),
+            "--symbols",
+            "BTCUSDT",
+            "--start-day",
+            "2026-06-01",
+            "--end-day",
+            "2026-06-30",
+            "--archive-granularity",
+            "monthly",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured_granularity == ["monthly"]
+
+
+def test_optimize_command_generates_optimized_layout(tmp_path: Path) -> None:
+    raw_file = (
+        tmp_path
+        / "binance"
+        / "futures"
+        / "klines"
+        / "BTCUSDT"
+        / "BTCUSDT_klines_1m_2026-06-09.parquet"
+    )
+    raw_file.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "open_time": [1_780_963_200_000],
+            "open": ["100"],
+            "high": ["101"],
+            "low": ["99"],
+            "close": ["100.5"],
+            "volume": ["10"],
+            "trade_count": ["3"],
+        }
+    ).write_parquet(raw_file)
+
+    result = CliRunner().invoke(app, ["optimize", "--root", str(tmp_path), "--symbols", "BTCUSDT"])
+
+    assert result.exit_code == 0
+    payload = cast("dict[str, object]", json.loads(result.output))
+    assert payload["optimized_count"] == 1
+    assert (
+        tmp_path
+        / "parbp_optimized"
+        / "binance"
+        / "futures"
+        / "klines"
+        / "symbol=BTCUSDT"
+        / "interval=1m"
+        / "candles.parquet"
+    ).exists()
+
+
+def test_validate_command_fails_missing_status_manifest(tmp_path: Path) -> None:
+    result = CliRunner().invoke(app, ["validate", "--root", str(tmp_path)])
+
+    assert result.exit_code == 1
+    payload = cast("dict[str, object]", json.loads(result.output))
+    assert payload["valid"] is False

@@ -5,7 +5,8 @@ from enum import StrEnum
 from typing import Protocol
 from urllib.parse import unquote
 
-from binance_usdm_parquet_data.archive_index import ArchivePrefixPage, encode_path_segment
+from binance_usdm_parquet_data.archive_index import ArchivePrefixPage
+from binance_usdm_parquet_data.storage_keys import symbol_storage_key
 
 
 class ArchiveDataset(StrEnum):
@@ -55,7 +56,7 @@ def build_symbol_universe(
             SymbolMetadata(
                 symbol=symbol,
                 quote_asset=_quote_asset(symbol, quote_assets) or "",
-                storage_key=encode_path_segment(symbol),
+                storage_key=symbol_storage_key(symbol),
                 datasets={
                     dataset: symbol in symbols for dataset, symbols in dataset_symbols.items()
                 },

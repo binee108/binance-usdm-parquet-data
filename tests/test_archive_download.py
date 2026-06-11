@@ -12,7 +12,9 @@ from binance_usdm_parquet_data.archive_download import (
     ArchiveDownloadFailure,
     ArchiveHttpClient,
     DailyArchiveRequest,
+    MonthlyArchiveRequest,
     download_daily_archive_to_parquet,
+    download_monthly_archive_to_parquet,
 )
 
 
@@ -82,6 +84,42 @@ def test_daily_kline_zip_with_header_is_normalized_to_parquet(tmp_path: Path) ->
 
     assert not isinstance(result, ArchiveDownloadFailure)
     assert pl.read_parquet(result.output_path).item(0, "trade_count") == 42
+
+
+def test_monthly_kline_zip_is_normalized_to_monthly_parquet(tmp_path: Path) -> None:
+    body = "1700000000000,100.1,101.2,99.9,100.8,12.34,1700000059999,1234.5,42,6.0,600.0,0\n"
+    archive = _zip_csv("BTCUSDT-1m-2026-06.csv", body)
+    checksum = hashlib.sha256(archive).hexdigest()
+    client: ArchiveHttpClient = FakeArchiveClient(archive, f"{checksum}  BTCUSDT-1m-2026-06.zip")
+
+    result = download_monthly_archive_to_parquet(
+        client,
+        MonthlyArchiveRequest("klines", "BTCUSDT", "1m", "2026-06"),
+        tmp_path,
+    )
+
+    assert not isinstance(result, ArchiveDownloadFailure)
+    assert result.row_count == 1
+    assert result.output_path.name == "BTCUSDT_klines_1m_2026-06.parquet"
+    assert pl.read_parquet(result.output_path).item(0, "trade_count") == 42
+
+
+def test_symbol_path_segment_cannot_escape_root(tmp_path: Path) -> None:
+    body = "1700000000000,100.1,101.2,99.9,100.8,12.34,1700000059999,1234.5,42,6.0,600.0,0\n"
+    archive = _zip_csv("ABSUSDT-1m-2026-06-09.csv", body)
+    checksum = hashlib.sha256(archive).hexdigest()
+    client: ArchiveHttpClient = FakeArchiveClient(archive, f"{checksum}  ABSUSDT-1m-2026-06-09.zip")
+
+    result = download_daily_archive_to_parquet(
+        client,
+        DailyArchiveRequest("klines", "/ABSUSDT", "1m", date(2026, 6, 9)),
+        tmp_path,
+    )
+
+    assert not isinstance(result, ArchiveDownloadFailure)
+    assert result.output_path.is_relative_to(tmp_path)
+    assert result.output_path.parent.name == "%2FABSUSDT"
+    assert not Path("/ABSUSDT_klines_1m_2026-06-09.parquet").exists()
 
 
 def _zip_csv(name: str, body: str) -> bytes:

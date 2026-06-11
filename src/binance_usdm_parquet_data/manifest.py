@@ -46,6 +46,18 @@ class CollectorRun:
 
 
 @dataclass(frozen=True, slots=True)
+class CollectorSource:
+    dataset: str
+    symbol: str
+    interval: str | None
+    target_date: str
+    source_url: str
+    output_path: str
+    checksum: str | None
+    row_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ManifestStore:
     root: Path
 
@@ -59,12 +71,14 @@ class ManifestStore:
         last_run: CollectorRun | None,
         freshness: tuple[DatasetFreshness, ...],
         failures: tuple[CollectorFailure, ...],
+        sources: tuple[CollectorSource, ...] = (),
     ) -> None:
         self.manifest_root.mkdir(parents=True, exist_ok=True)
         payload: JsonObject = {
             "status": "ok" if not failures else "degraded",
             "last_run": None if last_run is None else _run_dict(last_run),
             "failed_item_count": len(failures),
+            "source_count": len(sources),
             "freshness": [_freshness_dict(item) for item in freshness],
             "failures": [_failure_dict(item) for item in failures],
         }
@@ -73,6 +87,10 @@ class ManifestStore:
             json.dumps(_failure_dict(item), sort_keys=True) + "\n" for item in failures
         )
         _atomic_write_text(self.manifest_root / "failures.jsonl", failure_lines)
+        source_lines = "".join(
+            json.dumps(_source_dict(item), sort_keys=True) + "\n" for item in sources
+        )
+        _atomic_write_text(self.manifest_root / "sources.jsonl", source_lines)
 
 
 def read_status(root: Path) -> JsonObject:
@@ -82,6 +100,7 @@ def read_status(root: Path) -> JsonObject:
             "status": "missing",
             "last_run": None,
             "failed_item_count": 0,
+            "source_count": 0,
             "freshness": [],
             "failures": [],
         }
@@ -127,6 +146,19 @@ def _failure_dict(item: CollectorFailure) -> JsonObject:
         "error_code": item.error_code,
         "error_message": item.error_message,
         "retryable": item.retryable,
+    }
+
+
+def _source_dict(item: CollectorSource) -> JsonObject:
+    return {
+        "dataset": item.dataset,
+        "symbol": item.symbol,
+        "interval": item.interval,
+        "target_date": item.target_date,
+        "source_url": item.source_url,
+        "output_path": item.output_path,
+        "checksum": item.checksum,
+        "row_count": item.row_count,
     }
 
 
