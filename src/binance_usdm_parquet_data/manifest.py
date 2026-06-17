@@ -111,6 +111,48 @@ def read_status(root: Path) -> JsonObject:
     return cast("JsonObject", raw)
 
 
+def publish_status(
+    root: Path,
+    *,
+    last_run: CollectorRun | None,
+    freshness: tuple[DatasetFreshness, ...],
+    failures: tuple[CollectorFailure, ...],
+    sources: tuple[CollectorSource, ...] = (),
+) -> None:
+    ManifestStore(root).publish_status(
+        last_run=last_run,
+        freshness=freshness,
+        failures=failures,
+        sources=sources,
+    )
+
+
+def read_failures(root: Path) -> tuple[CollectorFailure, ...]:
+    records = _read_jsonl(_manifest_file(root, "failures.jsonl"))
+    return tuple(_failure_from_dict(item) for item in records)
+
+
+def append_failure(root: Path, failure: CollectorFailure) -> None:
+    failures = (*read_failures(root), failure)
+    _atomic_write_jsonl(
+        _manifest_file(root, "failures.jsonl"),
+        [_failure_dict(item) for item in failures],
+    )
+
+
+def read_sources(root: Path) -> tuple[CollectorSource, ...]:
+    records = _read_jsonl(_manifest_file(root, "sources.jsonl"))
+    return tuple(_source_from_dict(item) for item in records)
+
+
+def append_source(root: Path, source: CollectorSource) -> None:
+    sources = (*read_sources(root), source)
+    _atomic_write_jsonl(
+        _manifest_file(root, "sources.jsonl"),
+        [_source_dict(item) for item in sources],
+    )
+
+
 def _run_dict(run: CollectorRun) -> JsonObject:
     return {
         "id": run.run_id,
@@ -160,6 +202,89 @@ def _source_dict(item: CollectorSource) -> JsonObject:
         "checksum": item.checksum,
         "row_count": item.row_count,
     }
+
+
+def _failure_from_dict(item: JsonObject) -> CollectorFailure:
+    return CollectorFailure(
+        dataset=_required_str(item, "dataset"),
+        symbol=_required_str(item, "symbol"),
+        interval=_optional_str(item, "interval"),
+        target_date=_required_str(item, "target_date"),
+        source_url=_required_str(item, "source_url"),
+        attempt_count=_required_int(item, "attempt_count"),
+        error_code=_required_str(item, "error_code"),
+        error_message=_required_str(item, "error_message"),
+        retryable=_required_bool(item, "retryable"),
+    )
+
+
+def _source_from_dict(item: JsonObject) -> CollectorSource:
+    return CollectorSource(
+        dataset=_required_str(item, "dataset"),
+        symbol=_required_str(item, "symbol"),
+        interval=_optional_str(item, "interval"),
+        target_date=_required_str(item, "target_date"),
+        source_url=_required_str(item, "source_url"),
+        output_path=_required_str(item, "output_path"),
+        checksum=_optional_str(item, "checksum"),
+        row_count=_required_int(item, "row_count"),
+    )
+
+
+def _required_str(item: JsonObject, key: str) -> str:
+    value = item.get(key)
+    if isinstance(value, str):
+        return value
+    msg = f"manifest field {key} must be a string"
+    raise TypeError(msg)
+
+
+def _optional_str(item: JsonObject, key: str) -> str | None:
+    value = item.get(key)
+    if value is None or isinstance(value, str):
+        return value
+    msg = f"manifest field {key} must be a string or null"
+    raise TypeError(msg)
+
+
+def _required_int(item: JsonObject, key: str) -> int:
+    value = item.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    msg = f"manifest field {key} must be an integer"
+    raise TypeError(msg)
+
+
+def _required_bool(item: JsonObject, key: str) -> bool:
+    value = item.get(key)
+    if isinstance(value, bool):
+        return value
+    msg = f"manifest field {key} must be a boolean"
+    raise TypeError(msg)
+
+
+def _manifest_file(root: Path, name: str) -> Path:
+    return root / "manifests" / "binance" / "usdm" / name
+
+
+def _read_jsonl(path: Path) -> tuple[JsonObject, ...]:
+    if not path.exists():
+        return ()
+    records: list[JsonObject] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        raw = cast("JsonValue", json.loads(line))
+        if not isinstance(raw, dict):
+            msg = f"manifest JSONL record is not an object: {path}"
+            raise TypeError(msg)
+        records.append(cast("JsonObject", raw))
+    return tuple(records)
+
+
+def _atomic_write_jsonl(path: Path, records: list[JsonObject]) -> None:
+    lines = "".join(json.dumps(item, sort_keys=True) + "\n" for item in records)
+    _atomic_write_text(path, lines)
 
 
 def _atomic_write_json(path: Path, payload: JsonObject) -> None:

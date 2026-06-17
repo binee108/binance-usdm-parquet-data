@@ -14,6 +14,7 @@ from binance_usdm_parquet_data.funding_rate import BinanceFundingRateClient
 from binance_usdm_parquet_data.http_client import Httpx2SyncClient
 from binance_usdm_parquet_data.liquidity import fetch_current_quote_liquidity
 from binance_usdm_parquet_data.manifest import JsonObject, JsonValue, read_status
+from binance_usdm_parquet_data.paths import InvalidMarketDataKeyError, require_interval
 from binance_usdm_parquet_data.refresh import RefreshRequest, refresh_market_data
 from binance_usdm_parquet_data.storage_keys import symbol_storage_key
 from binance_usdm_parquet_data.symbol_universe import (
@@ -93,13 +94,14 @@ def refresh(
     today = datetime.now(UTC).date()
     target_day = today if not end_day else datetime.fromisoformat(end_day).date()
     requested_symbols = _parse_symbols(symbols)
+    checked_interval = _parse_interval(interval)
     request = RefreshRequest(
         root=root,
         symbols=requested_symbols,
         start_day=target_day if not start_day else datetime.fromisoformat(start_day).date(),
         end_day=target_day,
         datasets=tuple(dataset.strip() for dataset in datasets.split(",") if dataset.strip()),
-        interval=interval,
+        interval=checked_interval,
         optimize=optimize_output,
         archive_granularity=archive_granularity,
     )
@@ -129,21 +131,22 @@ def optimize(
     interval: Annotated[str, typer.Option("--interval", help="Archive interval")] = "1m",
 ) -> None:
     optimized: list[str] = []
+    checked_interval = _parse_interval(interval)
     for symbol in _parse_local_symbols(root, symbols):
-        raw_files = _raw_kline_files(root, symbol, interval)
+        raw_files = _raw_kline_files(root, symbol, checked_interval)
         if not raw_files:
             continue
         output = optimize_klines(
             raw_files=tuple(raw_files),
             output_root=root / "parbp_optimized" / "binance" / "futures",
             symbol=symbol,
-            interval=interval,
+            interval=checked_interval,
         )
         optimized.append(str(output))
     outputs: list[JsonValue] = list(optimized)
     payload: JsonObject = {
         "root": str(root),
-        "interval": interval,
+        "interval": checked_interval,
         "optimized_count": len(optimized),
         "outputs": outputs,
     }
@@ -189,6 +192,13 @@ def _parse_local_symbols(root: Path, value: str) -> tuple[str, ...]:
     if value.strip().lower() == "all-local":
         return _local_raw_symbols(root)
     return _parse_symbols(value)
+
+
+def _parse_interval(value: str) -> str:
+    try:
+        return require_interval(value)
+    except InvalidMarketDataKeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _local_raw_symbols(root: Path) -> tuple[str, ...]:

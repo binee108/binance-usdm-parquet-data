@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Final, override
+from typing import Final, assert_never, override
 from urllib.parse import quote
 
 from binance_usdm_parquet_data.config import DEFAULT_ROOT
@@ -13,6 +14,12 @@ DEFAULT_CONTAINER_MARKET_DATA_ROOT: Final = Path("/market-data")
 SYMBOL_RE: Final = re.compile(r"^[A-Z0-9_%=\-]+$")
 INTERVAL_RE: Final = re.compile(r"^[0-9]+[mhdwM]$")
 SYMBOL_SAFE_CHARS: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_%=-"
+
+
+class RawArchiveDataset(StrEnum):
+    KLINES = "klines"
+    PREMIUM_INDEX_KLINES = "premiumIndexKlines"
+    FUNDING_RATE = "fundingRate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +68,19 @@ def require_interval(value: str) -> str:
         field = "interval"
         raise InvalidMarketDataKeyError(field, value)
     return value
+
+
+def require_raw_archive_dataset(value: str) -> RawArchiveDataset:
+    match value:
+        case "klines":
+            return RawArchiveDataset.KLINES
+        case "premiumIndexKlines" | "premium_index_klines":
+            return RawArchiveDataset.PREMIUM_INDEX_KLINES
+        case "fundingRate" | "funding_rate":
+            return RawArchiveDataset.FUNDING_RATE
+        case _:
+            field = "dataset"
+            raise InvalidMarketDataKeyError(field, value)
 
 
 def optimized_klines_file(root: Path | None, symbol: str, interval: str) -> Path:
@@ -114,6 +134,18 @@ def kline_files_for_read_from_optimized_root(root: Path, symbol: str, interval: 
     return [optimized] if optimized.exists() else []
 
 
+def find_optimized_klines(
+    root: Path | None,
+    *,
+    symbol: str | None = None,
+    interval: str | None = None,
+) -> tuple[Path, ...]:
+    optimized_root = optimized_futures_root(root) / "klines"
+    symbol_part = "*" if symbol is None else f"symbol={require_symbol(symbol)}"
+    interval_part = "*" if interval is None else f"interval={require_interval(interval)}"
+    return tuple(sorted(optimized_root.glob(f"{symbol_part}/{interval_part}/candles.parquet")))
+
+
 def funding_rate_files(root: Path | None, symbol: str) -> list[Path]:
     checked_symbol = require_symbol(symbol)
     return sorted((raw_futures_root(root) / "fundingRate" / checked_symbol).glob("*.parquet"))
@@ -125,6 +157,58 @@ def premium_index_kline_files(root: Path | None, symbol: str, interval: str) -> 
     directory = raw_futures_root(root) / "premiumIndexKlines" / checked_symbol
     pattern = f"{checked_symbol}_premiumIndexKlines_{checked_interval}_*.parquet"
     return sorted(directory.glob(pattern))
+
+
+def find_raw_archives(
+    root: Path | None,
+    *,
+    dataset: str | None = None,
+    symbol: str | None = None,
+    interval: str | None = None,
+) -> tuple[Path, ...]:
+    checked_symbol = None if symbol is None else require_symbol(symbol)
+    checked_interval = None if interval is None else require_interval(interval)
+    datasets = (
+        tuple(RawArchiveDataset)
+        if dataset is None
+        else (require_raw_archive_dataset(dataset),)
+    )
+    return tuple(
+        sorted(
+            path
+            for archive_dataset in datasets
+            for path in _find_raw_archive_dataset(
+                raw_futures_root(root),
+                archive_dataset,
+                checked_symbol,
+                checked_interval,
+            )
+        )
+    )
+
+
+def _find_raw_archive_dataset(
+    root: Path,
+    dataset: RawArchiveDataset,
+    symbol: str | None,
+    interval: str | None,
+) -> tuple[Path, ...]:
+    symbol_part = "*" if symbol is None else symbol
+    match dataset:
+        case RawArchiveDataset.KLINES:
+            interval_part = "*" if interval is None else interval
+            pattern = f"{symbol_part}_klines_{interval_part}_*.parquet"
+            return tuple((root / dataset.value).glob(f"{symbol_part}/{pattern}"))
+        case RawArchiveDataset.PREMIUM_INDEX_KLINES:
+            interval_part = "*" if interval is None else interval
+            pattern = f"{symbol_part}_premiumIndexKlines_{interval_part}_*.parquet"
+            return tuple((root / dataset.value).glob(f"{symbol_part}/{pattern}"))
+        case RawArchiveDataset.FUNDING_RATE:
+            if interval is not None:
+                return ()
+            pattern = f"{symbol_part}_fundingRate_*.parquet"
+            return tuple((root / dataset.value).glob(f"{symbol_part}/{pattern}"))
+    assert_never(dataset)
 
 
 def _legacy_raw_symbol_dir_name(symbol: str, checked_symbol: str) -> str | None:

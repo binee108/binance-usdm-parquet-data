@@ -80,6 +80,10 @@ def record_missing_klines(root: Path | None, ranges: list[MissingKlineRange]) ->
             tmp_path.unlink(missing_ok=True)
 
 
+def append_missing_klines(root: Path | None, ranges: list[MissingKlineRange]) -> None:
+    record_missing_klines(root, ranges)
+
+
 def _payload_from_range(missing_range: MissingKlineRange) -> MissingKlinePayload:
     return {
         "dataset": "klines",
@@ -113,7 +117,8 @@ def _missing_klines_lock(path: Path) -> Generator[None]:
                 if metadata is not None and not _lock_targets_path(metadata, path):
                     msg = f"stale missing klines lock targets a different file: {lock_path}"
                     raise MissingKlinesStaleLockError(msg) from None
-                lock_path.unlink(missing_ok=True)
+                if _claim_stale_lock(lock_path):
+                    continue
                 continue
             if time.monotonic() >= deadline:
                 msg = f"timed out waiting for lock: {lock_path}"
@@ -142,6 +147,16 @@ def _lock_metadata(path: Path, owner_token: str) -> dict[str, str | int | float]
         "operation": "record_missing_klines",
         "owner_token": owner_token,
     }
+
+
+def _claim_stale_lock(lock_path: Path) -> bool:
+    tombstone = lock_path.with_name(f".{lock_path.name}.{os.getpid()}.{uuid.uuid4().hex}.stale")
+    try:
+        _ = lock_path.replace(tombstone)
+    except FileNotFoundError:
+        return False
+    tombstone.unlink(missing_ok=True)
+    return True
 
 
 def _read_lock_metadata(path: Path) -> dict[str, str | int | float] | None:

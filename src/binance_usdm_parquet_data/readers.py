@@ -5,7 +5,11 @@ from typing import Final, cast
 
 import duckdb
 
-from binance_usdm_parquet_data.paths import funding_rate_files, kline_files_for_read
+from binance_usdm_parquet_data.paths import (
+    funding_rate_files,
+    kline_files_for_read,
+    premium_index_kline_files,
+)
 from binance_usdm_parquet_data.quality import record_missing_klines
 from binance_usdm_parquet_data.reader_sql import (
     FundingRow,
@@ -161,6 +165,22 @@ def load_funding_rates(
         if (start_ts is None or event.timestamp >= start_ts)
         and (end_ts is None or event.timestamp <= end_ts)
     )
+
+
+def load_premium_index_klines(
+    root: Path | None,
+    symbol: str,
+    interval: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> tuple[KlineRecord, ...]:
+    files = premium_index_kline_files(root, symbol, interval)
+    if not files:
+        return ()
+    sql, params = one_minute_sql(files, QueryWindow(start_ts, end_ts))
+    with duckdb.connect(":memory:") as connection:
+        rows = cast("list[KlineRow]", connection.execute(sql, params).fetchall())
+    return _kline_records(rows)
 
 
 def record_kline_gaps(

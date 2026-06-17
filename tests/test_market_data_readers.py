@@ -11,6 +11,7 @@ import pytest
 from binance_usdm_parquet_data.paths import optimized_klines_file
 from binance_usdm_parquet_data.quality import (
     MissingKlinesStaleLockError,
+    append_missing_klines,
     missing_klines_path,
     read_missing_klines,
     record_missing_klines,
@@ -18,6 +19,7 @@ from binance_usdm_parquet_data.quality import (
 from binance_usdm_parquet_data.readers import (
     load_funding_rates,
     load_intrabar_buckets,
+    load_premium_index_klines,
     load_resampled_klines,
 )
 from binance_usdm_parquet_data.records import MissingKlineRange
@@ -50,6 +52,24 @@ def _write_funding_rates(path: Path) -> None:
         {
             "fundingTime": [1_704_067_200_000, 1_704_096_000_000],
             "fundingRate": ["0.0001", "-0.0002"],
+        }
+    ).write_parquet(path)
+
+
+def _write_premium_index_klines(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "open_time": [
+                datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+                datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
+                datetime(2024, 1, 1, 0, 2, tzinfo=UTC),
+            ],
+            "open": ["1.00", "1.10", "1.20"],
+            "high": ["1.20", "1.30", "1.40"],
+            "low": ["0.90", "1.00", "1.10"],
+            "close": ["1.10", "1.20", "1.30"],
+            "volume": ["0", "0", "0"],
         }
     ).write_parquet(path)
 
@@ -115,6 +135,40 @@ def test_load_funding_rates_reads_legacy_rest_columns_and_filters_seconds(tmp_pa
     ]
 
 
+def test_load_premium_index_klines_reads_raw_files_and_filters_window(
+    tmp_path: Path,
+) -> None:
+    _write_premium_index_klines(
+        tmp_path
+        / "binance"
+        / "futures"
+        / "premiumIndexKlines"
+        / "BTCUSDT"
+        / "BTCUSDT_premiumIndexKlines_1m_2024-01.parquet"
+    )
+
+    candles = load_premium_index_klines(
+        tmp_path,
+        "BTCUSDT",
+        "1m",
+        start_ts=1_704_067_260,
+        end_ts=1_704_067_320,
+    )
+
+    assert [(candle.timestamp, candle.open, candle.close) for candle in candles] == [
+        (1_704_067_260, 1.1, 1.2),
+        (1_704_067_320, 1.2, 1.3),
+    ]
+
+
+def test_load_premium_index_klines_returns_empty_tuple_when_files_are_missing(
+    tmp_path: Path,
+) -> None:
+    candles = load_premium_index_klines(tmp_path, "BTCUSDT", "1m")
+
+    assert candles == ()
+
+
 def test_scan_local_status_reports_existing_files_when_status_manifest_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -143,6 +197,27 @@ def test_scan_local_status_reports_existing_files_when_status_manifest_is_missin
     assert summary.source_count == 2
     assert [item.dataset for item in summary.freshness] == ["klines"]
     assert summary.freshness[0].latest_complete_utc_day == "2026-06-30"
+
+
+def test_append_missing_klines_public_name_records_missing_ranges(tmp_path: Path) -> None:
+    append_missing_klines(
+        tmp_path,
+        [
+            MissingKlineRange(
+                symbol="BTCUSDT",
+                interval="1m",
+                missing_start_ts=1_700_000_000,
+                missing_end_ts=1_700_000_060,
+                missing_count=1,
+                observed_before_ts=1_699_999_940,
+                observed_after_ts=1_700_000_120,
+            )
+        ],
+    )
+
+    assert [item["missing_start_ts"] for item in read_missing_klines(tmp_path)] == [
+        1_700_000_000
+    ]
 
 
 def test_missing_klines_stale_lock_rejects_different_target_metadata(

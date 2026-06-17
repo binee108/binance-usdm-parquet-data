@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import cast
+
 from binance_usdm_parquet_data.archive_index import ArchivePrefixPage
 from binance_usdm_parquet_data.symbol_universe import (
     ArchiveDataset,
     ArchiveListingClient,
     build_symbol_universe,
+    publish_symbol_universe,
+    read_symbol_universe,
 )
 
 
@@ -64,3 +70,36 @@ def test_archive_universe_can_be_reconfigured_without_changing_default_scope() -
         "DELISTEDUSDT",
         "ΩUSDT",
     ]
+
+
+def test_read_symbol_universe_parses_parbp_simple_manifest(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifests" / "binance" / "usdm" / "symbol_universe.json"
+    manifest.parent.mkdir(parents=True)
+    _ = manifest.write_text(
+        json.dumps({"quote_asset": "USDT", "symbols": ["ETHUSDT", "BTCUSDT"]}) + "\n",
+        encoding="utf-8",
+    )
+
+    universe = read_symbol_universe(tmp_path)
+
+    assert [symbol.symbol for symbol in universe.symbols] == ["ETHUSDT", "BTCUSDT"]
+    assert [symbol.quote_asset for symbol in universe.symbols] == ["USDT", "USDT"]
+
+
+def test_publish_symbol_universe_accepts_symbols_and_writes_readable_manifest(
+    tmp_path: Path,
+) -> None:
+    publish_symbol_universe(tmp_path, ("ETHUSDT", "BTCUSDT"))
+
+    universe = read_symbol_universe(tmp_path)
+    payload = cast(
+        "dict[str, object]",
+        json.loads(
+            (tmp_path / "manifests" / "binance" / "usdm" / "symbol_universe.json").read_text(
+                encoding="utf-8"
+            )
+        ),
+    )
+
+    assert [symbol.symbol for symbol in universe.symbols] == ["BTCUSDT", "ETHUSDT"]
+    assert payload["quote_asset"] == "USDT"

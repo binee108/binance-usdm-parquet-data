@@ -12,7 +12,7 @@ from typing import Protocol
 import polars as pl
 
 from binance_usdm_parquet_data.parquet_storage import normalize_kline_frame
-from binance_usdm_parquet_data.storage_keys import symbol_storage_key
+from binance_usdm_parquet_data.paths import require_interval, require_symbol
 
 SHA256_HEX_LENGTH = 64
 
@@ -115,21 +115,23 @@ def download_monthly_archive_to_parquet(
 
 def _daily_zip_url(request: DailyArchiveRequest) -> str:
     dataset_path = _dataset_archive_path(request.dataset)
-    remote_symbol = symbol_storage_key(request.symbol)
-    filename = f"{remote_symbol}-{request.interval}-{request.day.isoformat()}.zip"
+    remote_symbol = require_symbol(request.symbol)
+    interval = require_interval(request.interval)
+    filename = f"{remote_symbol}-{interval}-{request.day.isoformat()}.zip"
     return (
         f"{request.base_url.rstrip('/')}/data/futures/um/daily/{dataset_path}/"
-        f"{remote_symbol}/{request.interval}/{filename}"
+        f"{remote_symbol}/{interval}/{filename}"
     )
 
 
 def _monthly_zip_url(request: MonthlyArchiveRequest) -> str:
     dataset_path = _dataset_archive_path(request.dataset)
-    remote_symbol = symbol_storage_key(request.symbol)
-    filename = f"{remote_symbol}-{request.interval}-{request.month}.zip"
+    remote_symbol = require_symbol(request.symbol)
+    interval = require_interval(request.interval)
+    filename = f"{remote_symbol}-{interval}-{request.month}.zip"
     return (
         f"{request.base_url.rstrip('/')}/data/futures/um/monthly/{dataset_path}/"
-        f"{remote_symbol}/{request.interval}/{filename}"
+        f"{remote_symbol}/{interval}/{filename}"
     )
 
 
@@ -147,9 +149,10 @@ def _dataset_archive_path(dataset: str) -> str:
 def _daily_parquet_path(root: Path, request: DailyArchiveRequest) -> Path:
     dataset_dir = "klines" if request.dataset == "klines" else "premiumIndexKlines"
     dataset_name = "klines" if request.dataset == "klines" else "premiumIndexKlines"
-    storage_key = symbol_storage_key(request.symbol)
+    storage_key = require_symbol(request.symbol)
+    interval = require_interval(request.interval)
     filename = (
-        f"{storage_key}_{dataset_name}_{request.interval}_{request.day.isoformat()}.parquet"
+        f"{storage_key}_{dataset_name}_{interval}_{request.day.isoformat()}.parquet"
     )
     return root / "binance" / "futures" / dataset_dir / storage_key / filename
 
@@ -157,8 +160,9 @@ def _daily_parquet_path(root: Path, request: DailyArchiveRequest) -> Path:
 def _monthly_parquet_path(root: Path, request: MonthlyArchiveRequest) -> Path:
     dataset_dir = "klines" if request.dataset == "klines" else "premiumIndexKlines"
     dataset_name = "klines" if request.dataset == "klines" else "premiumIndexKlines"
-    storage_key = symbol_storage_key(request.symbol)
-    filename = f"{storage_key}_{dataset_name}_{request.interval}_{request.month}.parquet"
+    storage_key = require_symbol(request.symbol)
+    interval = require_interval(request.interval)
+    filename = f"{storage_key}_{dataset_name}_{interval}_{request.month}.parquet"
     return root / "binance" / "futures" / dataset_dir / storage_key / filename
 
 
