@@ -80,6 +80,10 @@ fixable = ["ALL"]
     "D",
 ]
 "src/binance_usdm_parquet_data/cli.py" = ["PLR0913"]
+"src/binance_usdm_parquet_data/duckdb_optimize.py" = ["S608"]
+"src/binance_usdm_parquet_data/paths.py" = ["D105"]
+"src/binance_usdm_parquet_data/reader_sql.py" = ["S608"]
+"src/binance_usdm_parquet_data/readers.py" = ["PLR0913", "S608"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from binance_usdm_parquet_data.duckdb_optimize import optimize_klines
 from binance_usdm_parquet_data.parquet_storage import normalize_kline_frame
@@ -65,3 +66,84 @@ def test_optimize_klines_writes_symbol_interval_layout_and_resamples(tmp_path: P
             "trade_count": 5,
         }
     ]
+
+
+def test_optimize_klines_canonicalizes_symbol_layout(tmp_path: Path) -> None:
+    raw_path = tmp_path / "raw.parquet"
+    pl.DataFrame(
+        {
+            "open_time": [1_700_000_000_000],
+            "open": ["100.0"],
+            "high": ["102.0"],
+            "low": ["99.0"],
+            "close": ["101.0"],
+            "volume": ["10.0"],
+        }
+    ).write_parquet(raw_path)
+
+    output = optimize_klines(
+        raw_files=(raw_path,),
+        output_root=tmp_path / "optimized",
+        symbol="btcusdt",
+        interval="1m",
+    )
+
+    assert output == (
+        tmp_path / "optimized" / "klines" / "symbol=BTCUSDT" / "interval=1m" / "candles.parquet"
+    )
+
+
+def test_optimize_klines_handles_mixed_trade_count_schemas(tmp_path: Path) -> None:
+    first = tmp_path / "number_of_trades.parquet"
+    second = tmp_path / "trade_count.parquet"
+    pl.DataFrame(
+        {
+            "open_time": [1_700_000_000_000],
+            "open": ["100.0"],
+            "high": ["102.0"],
+            "low": ["99.0"],
+            "close": ["101.0"],
+            "volume": ["10.0"],
+            "number_of_trades": [2],
+        }
+    ).write_parquet(first)
+    pl.DataFrame(
+        {
+            "open_time": [1_700_000_060_000],
+            "open": ["101.0"],
+            "high": ["103.0"],
+            "low": ["100.5"],
+            "close": ["102.5"],
+            "volume": ["20.0"],
+            "trade_count": [3],
+        }
+    ).write_parquet(second)
+
+    output = optimize_klines(
+        raw_files=(first, second),
+        output_root=tmp_path / "optimized",
+        symbol="BTCUSDT",
+        interval="1h",
+    )
+
+    result = pl.read_parquet(output)
+    assert result.item(0, "trade_count") == 5
+
+
+def test_optimize_klines_rejects_traversal_interval_before_filesystem_write(
+    tmp_path: Path,
+) -> None:
+    raw_path = tmp_path / "raw.parquet"
+    raw_path.touch()
+    output_root = tmp_path / "optimized"
+
+    with pytest.raises(ValueError, match="Invalid market data interval"):
+        _ = optimize_klines(
+            raw_files=(raw_path,),
+            output_root=output_root,
+            symbol="BTCUSDT",
+            interval="x/../../../../outside/1m",
+        )
+
+    assert not output_root.exists()
+    assert not (tmp_path / "outside").exists()
