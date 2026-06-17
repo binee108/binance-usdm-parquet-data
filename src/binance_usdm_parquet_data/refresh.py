@@ -31,6 +31,10 @@ from binance_usdm_parquet_data.manifest import (
     DatasetFreshness,
     ManifestStore,
 )
+from binance_usdm_parquet_data.premium_index import (
+    PremiumIndexKlineClient,
+    backfill_premium_index_klines,
+)
 from binance_usdm_parquet_data.storage_keys import symbol_storage_key
 
 FUNDING_RATE_SOURCE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
@@ -57,11 +61,29 @@ class RefreshResult:
     failure_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ArchiveRefreshOutcome:
+    source: CollectorSource | None
+    failure: CollectorFailure | None
+    kline_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveRefreshCommand:
+    request: RefreshRequest
+    archive_client: ArchiveHttpClient
+    premium_client: PremiumIndexKlineClient | None
+    dataset: str
+    symbol: str
+    target_day: date
+
+
 def refresh_market_data(
     request: RefreshRequest,
     *,
     archive_client: ArchiveHttpClient,
     funding_client: FundingRateClient,
+    premium_client: PremiumIndexKlineClient | None = None,
 ) -> RefreshResult:
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
@@ -78,20 +100,23 @@ def refresh_market_data(
                     sources.append(funding_result)
                 continue
             for target_day in _archive_target_days(request):
-                result = _refresh_archive_item(request, archive_client, dataset, symbol, target_day)
-                if isinstance(result, ArchiveDownloadFailure):
-                    failures.append(
-                        _archive_failure(result, dataset, symbol, request.interval, target_day)
+                outcome = _handle_archive_refresh(
+                    ArchiveRefreshCommand(
+                        request=request,
+                        archive_client=archive_client,
+                        premium_client=premium_client,
+                        dataset=dataset,
+                        symbol=symbol,
+                        target_day=target_day,
                     )
-                elif isinstance(result, CollectorFailure):
-                    failures.append(result)
-                else:
+                )
+                if outcome.failure is not None:
+                    failures.append(outcome.failure)
+                if outcome.source is not None:
                     success_count += 1
-                    sources.append(
-                        _archive_source(result, dataset, symbol, request.interval, target_day)
-                    )
-                    if dataset == "klines":
-                        downloaded_klines[symbol].append(result.output_path)
+                    sources.append(outcome.source)
+                if outcome.kline_path is not None:
+                    downloaded_klines[symbol].append(outcome.kline_path)
     if request.optimize:
         _optimize_downloaded_klines(request, downloaded_klines)
     status = "succeeded" if not failures else "failed"
@@ -118,6 +143,77 @@ def refresh_market_data(
         status=status,
         success_count=success_count,
         failure_count=len(failures),
+    )
+
+
+def _handle_archive_refresh(command: ArchiveRefreshCommand) -> ArchiveRefreshOutcome:
+    result = _refresh_archive_item(
+        command.request,
+        command.archive_client,
+        command.dataset,
+        command.symbol,
+        command.target_day,
+    )
+    if isinstance(result, DownloadedArchiveFile):
+        return ArchiveRefreshOutcome(
+            source=_archive_source(
+                result,
+                command.dataset,
+                command.symbol,
+                command.request.interval,
+                command.target_day,
+            ),
+            failure=None,
+            kline_path=result.output_path if command.dataset == "klines" else None,
+        )
+    fallback = _refresh_premium_fallback(
+        command.request,
+        command.premium_client,
+        command.dataset,
+        command.symbol,
+        command.target_day,
+    )
+    if fallback is not None:
+        return ArchiveRefreshOutcome(source=fallback, failure=None, kline_path=None)
+    failure = (
+        _archive_failure(
+            result,
+            command.dataset,
+            command.symbol,
+            command.request.interval,
+            command.target_day,
+        )
+        if isinstance(result, ArchiveDownloadFailure)
+        else result
+    )
+    return ArchiveRefreshOutcome(source=None, failure=failure, kline_path=None)
+
+
+def _refresh_premium_fallback(
+    request: RefreshRequest,
+    premium_client: PremiumIndexKlineClient | None,
+    dataset: str,
+    symbol: str,
+    day: date,
+) -> CollectorSource | None:
+    if dataset != "premiumIndexKlines" or premium_client is None:
+        return None
+    backfill = backfill_premium_index_klines(
+        root=request.root,
+        symbol=symbol,
+        day=day,
+        interval=request.interval,
+        client=premium_client,
+    )
+    return CollectorSource(
+        dataset=dataset,
+        symbol=symbol,
+        interval=request.interval,
+        target_date=day.isoformat(),
+        source_url=backfill.source_url,
+        output_path=str(backfill.output_path),
+        checksum=None,
+        row_count=backfill.row_count,
     )
 
 

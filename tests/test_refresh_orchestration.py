@@ -11,7 +11,7 @@ from typing import cast
 import polars as pl
 
 from binance_usdm_parquet_data.archive_download import ArchiveHttpClient
-from binance_usdm_parquet_data.funding_rate import FundingRateClient, FundingRateRecord
+from binance_usdm_parquet_data.funding_rate import FundingRateClient, FundingRateRecord, JsonValue
 from binance_usdm_parquet_data.refresh import RefreshRequest, refresh_market_data
 
 
@@ -51,6 +51,12 @@ class FailingArchiveClient:
 
     def get_text(self, url: str) -> str:
         raise OSError(url)
+
+
+class EmptyPremiumClient:
+    def get_json(self, url: str, params: dict[str, str]) -> JsonValue:
+        del url, params
+        return []
 
 
 class RecordingArchiveClient:
@@ -143,6 +149,43 @@ def test_refresh_records_archive_exception_as_item_failure(tmp_path: Path) -> No
     failures = cast("list[dict[str, object]]", status["failures"])
     assert failures[0]["error_code"] == "archive_exception"
     assert failures[0]["retryable"] is True
+
+
+def test_refresh_uses_premium_rest_fallback_when_archive_is_missing(
+    tmp_path: Path,
+) -> None:
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("1000BTTCUSDT",),
+            start_day=date(2026, 6, 15),
+            end_day=date(2026, 6, 15),
+            datasets=("premiumIndexKlines",),
+            interval="1m",
+            optimize=False,
+        ),
+        archive_client=FailingArchiveClient(),
+        funding_client=FakeFundingClient(),
+        premium_client=EmptyPremiumClient(),
+    )
+
+    assert result.status == "succeeded"
+    assert result.success_count == 1
+    assert result.failure_count == 0
+    assert (
+        tmp_path
+        / "binance"
+        / "futures"
+        / "premiumIndexKlines"
+        / "1000BTTCUSDT"
+        / "1000BTTCUSDT_premiumIndexKlines_1m_2026-06-15.parquet"
+    ).exists()
+    status = cast(
+        dict[str, object],
+        json.loads((tmp_path / "manifests" / "binance" / "usdm" / "status.json").read_text()),
+    )
+    assert status["failed_item_count"] == 0
+    assert status["source_count"] == 1
 
 
 def test_refresh_monthly_archive_downloads_each_month_once(tmp_path: Path) -> None:
