@@ -38,7 +38,7 @@ class PremiumIndexKline:
     trade_count: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PremiumIndexKlinePayloadError(ValueError):
     field: str
     value: str

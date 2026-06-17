@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
 
@@ -25,11 +25,23 @@ from binance_usdm_parquet_data.symbol_universe import (
 
 app = typer.Typer(no_args_is_help=True)
 DEFAULT_ROOT = CollectorConfig().root
+ROOT_OPTION = cast(
+    "object",
+    typer.Option(
+        "--root",
+        help="Storage root",
+        exists=False,
+        file_okay=False,
+        dir_okay=True,
+        readable=False,
+        resolve_path=False,
+    ),
+)
 
 
 @app.command()
 def discover(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
 ) -> None:
     universe = _discover_usdt_universe()
     _print_json(
@@ -62,7 +74,7 @@ def liquidity() -> None:
 
 @app.command()
 def plan(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
 ) -> None:
     local_symbols = _local_raw_symbols(root)
     _print_json(
@@ -77,7 +89,7 @@ def plan(
 
 @app.command()
 def refresh(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
     symbols: Annotated[str, typer.Option("--symbols", help="Comma-separated symbols")] = "BTCUSDT",
     start_day: Annotated[str, typer.Option("--start-day", help="UTC start day")] = "",
     end_day: Annotated[str, typer.Option("--end-day", help="UTC end day")] = "",
@@ -123,7 +135,7 @@ def refresh(
 
 @app.command()
 def optimize(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
     symbols: Annotated[
         str,
         typer.Option("--symbols", help="Comma-separated symbols or all-local"),
@@ -155,14 +167,14 @@ def optimize(
 
 @app.command()
 def status(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
 ) -> None:
     _print_json(read_status(root))
 
 
 @app.command()
 def validate(
-    root: Annotated[Path, typer.Option("--root", help="Storage root")] = DEFAULT_ROOT,
+    root: Annotated[Path, ROOT_OPTION] = DEFAULT_ROOT,
 ) -> None:
     payload = read_status(root)
     valid = payload["status"] in {"ok", "degraded"} and payload["last_run"] is not None

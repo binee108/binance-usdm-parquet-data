@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import polars as pl
 import pytest
 
 from binance_usdm_parquet_data.duckdb_optimize import optimize_klines
+from binance_usdm_parquet_data.locks import default_lock_path, lock_metadata
 from binance_usdm_parquet_data.parquet_storage import normalize_kline_frame
 
 
@@ -128,6 +131,44 @@ def test_optimize_klines_handles_mixed_trade_count_schemas(tmp_path: Path) -> No
 
     result = pl.read_parquet(output)
     assert result.item(0, "trade_count") == 5
+
+
+def test_optimize_klines_claims_stale_output_lock(tmp_path: Path) -> None:
+    raw_path = tmp_path / "raw.parquet"
+    pl.DataFrame(
+        {
+            "open_time": [1_700_000_000_000],
+            "open": ["100.0"],
+            "high": ["102.0"],
+            "low": ["99.0"],
+            "close": ["101.0"],
+            "volume": ["10.0"],
+        }
+    ).write_parquet(raw_path)
+    output = (
+        tmp_path
+        / "optimized"
+        / "klines"
+        / "symbol=BTCUSDT"
+        / "interval=1m"
+        / "candles.parquet"
+    )
+    lock_path = default_lock_path(output)
+    lock_path.parent.mkdir(parents=True)
+    metadata = lock_metadata(output, "optimize_klines", "stale-owner")
+    metadata["created_at_epoch"] = time.time() - 1_000
+    _ = lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    written = optimize_klines(
+        raw_files=(raw_path,),
+        output_root=tmp_path / "optimized",
+        symbol="BTCUSDT",
+        interval="1m",
+    )
+
+    assert written == output
+    assert written.exists()
+    assert not lock_path.exists()
 
 
 def test_optimize_klines_rejects_traversal_interval_before_filesystem_write(

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
 from uuid import uuid4
 
 import polars as pl
@@ -24,6 +25,7 @@ from binance_usdm_parquet_data.funding_rate import (
     FundingRateRequest,
     collect_funding_rates,
 )
+from binance_usdm_parquet_data.locks import shared_file_lock
 from binance_usdm_parquet_data.manifest import (
     CollectorFailure,
     CollectorRun,
@@ -32,6 +34,7 @@ from binance_usdm_parquet_data.manifest import (
     ManifestStore,
 )
 from binance_usdm_parquet_data.premium_index import (
+    PREMIUM_INDEX_KLINES_URL,
     PremiumIndexKlineClient,
     backfill_premium_index_klines,
 )
@@ -51,6 +54,9 @@ class RefreshRequest:
     interval: str = "1m"
     optimize: bool = True
     archive_granularity: str = "daily"
+    max_concurrent_downloads: int = 4
+    http_timeout_seconds: float = 30.0
+    funding_rest_sleep_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,12 +84,54 @@ class ArchiveRefreshCommand:
     target_day: date
 
 
+@dataclass(frozen=True, slots=True)
+class RefreshClients:
+    archive_client: ArchiveHttpClient
+    funding_client: FundingRateClient
+    premium_client: PremiumIndexKlineClient | None
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetRefreshOutcome:
+    success_count: int
+    sources: tuple[CollectorSource, ...]
+    failures: tuple[CollectorFailure, ...]
+    kline_paths: tuple[Path, ...]
+
+
 def refresh_market_data(
     request: RefreshRequest,
     *,
     archive_client: ArchiveHttpClient,
     funding_client: FundingRateClient,
     premium_client: PremiumIndexKlineClient | None = None,
+) -> RefreshResult:
+    if request.max_concurrent_downloads < 1:
+        msg = "max_concurrent_downloads must be at least 1"
+        raise ValueError(msg)
+    if request.http_timeout_seconds <= 0:
+        msg = "http_timeout_seconds must be positive"
+        raise ValueError(msg)
+    if request.funding_rest_sleep_seconds < 0:
+        msg = "funding_rest_sleep_seconds must be non-negative"
+        raise ValueError(msg)
+    refresh_marker = request.root / "manifests" / "binance" / "usdm" / "refresh.json"
+    refresh_lock = refresh_marker.with_name(".refresh.lock")
+    with shared_file_lock(refresh_marker, "refresh_market_data", lock_path=refresh_lock):
+        return _refresh_market_data_unlocked(
+            request,
+            clients=RefreshClients(
+                archive_client=archive_client,
+                funding_client=funding_client,
+                premium_client=premium_client,
+            ),
+        )
+
+
+def _refresh_market_data_unlocked(
+    request: RefreshRequest,
+    *,
+    clients: RefreshClients,
 ) -> RefreshResult:
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
@@ -93,30 +141,16 @@ def refresh_market_data(
     success_count = 0
     for symbol in request.symbols:
         for dataset in request.datasets:
-            if dataset == "fundingRate":
-                for day in _days(request.start_day, request.end_day):
-                    funding_result = _refresh_funding(request, funding_client, symbol, day)
-                    success_count += 1
-                    sources.append(funding_result)
-                continue
-            for target_day in _archive_target_days(request):
-                outcome = _handle_archive_refresh(
-                    ArchiveRefreshCommand(
-                        request=request,
-                        archive_client=archive_client,
-                        premium_client=premium_client,
-                        dataset=dataset,
-                        symbol=symbol,
-                        target_day=target_day,
-                    )
-                )
-                if outcome.failure is not None:
-                    failures.append(outcome.failure)
-                if outcome.source is not None:
-                    success_count += 1
-                    sources.append(outcome.source)
-                if outcome.kline_path is not None:
-                    downloaded_klines[symbol].append(outcome.kline_path)
+            outcome = _refresh_dataset_items(
+                request,
+                clients=clients,
+                symbol=symbol,
+                dataset=dataset,
+            )
+            success_count += outcome.success_count
+            sources.extend(outcome.sources)
+            failures.extend(outcome.failures)
+            downloaded_klines[symbol].extend(outcome.kline_paths)
     if request.optimize:
         _optimize_downloaded_klines(request, downloaded_klines)
     status = "succeeded" if not failures else "failed"
@@ -146,6 +180,64 @@ def refresh_market_data(
     )
 
 
+def _refresh_dataset_items(
+    request: RefreshRequest,
+    *,
+    clients: RefreshClients,
+    symbol: str,
+    dataset: str,
+) -> DatasetRefreshOutcome:
+    if dataset == "fundingRate":
+        funding_sources = tuple(
+            _refresh_funding_item(request, clients.funding_client, symbol, day)
+            for day in _days(request.start_day, request.end_day)
+        )
+        return DatasetRefreshOutcome(
+            success_count=len(funding_sources),
+            sources=funding_sources,
+            failures=(),
+            kline_paths=(),
+        )
+    archive_sources: list[CollectorSource] = []
+    failures: list[CollectorFailure] = []
+    kline_paths: list[Path] = []
+    for target_day in _archive_target_days(request):
+        outcome = _handle_archive_refresh(
+            ArchiveRefreshCommand(
+                request=request,
+                archive_client=clients.archive_client,
+                premium_client=clients.premium_client,
+                dataset=dataset,
+                symbol=symbol,
+                target_day=target_day,
+            )
+        )
+        if outcome.failure is not None:
+            failures.append(outcome.failure)
+        if outcome.source is not None:
+            archive_sources.append(outcome.source)
+        if outcome.kline_path is not None:
+            kline_paths.append(outcome.kline_path)
+    return DatasetRefreshOutcome(
+        success_count=len(archive_sources),
+        sources=tuple(archive_sources),
+        failures=tuple(failures),
+        kline_paths=tuple(kline_paths),
+    )
+
+
+def _refresh_funding_item(
+    request: RefreshRequest,
+    funding_client: FundingRateClient,
+    symbol: str,
+    day: date,
+) -> CollectorSource:
+    source = _refresh_funding(request, funding_client, symbol, day)
+    if request.funding_rest_sleep_seconds > 0:
+        sleep(request.funding_rest_sleep_seconds)
+    return source
+
+
 def _handle_archive_refresh(command: ArchiveRefreshCommand) -> ArchiveRefreshOutcome:
     result = _refresh_archive_item(
         command.request,
@@ -166,13 +258,30 @@ def _handle_archive_refresh(command: ArchiveRefreshCommand) -> ArchiveRefreshOut
             failure=None,
             kline_path=result.output_path if command.dataset == "klines" else None,
         )
-    fallback = _refresh_premium_fallback(
-        command.request,
-        command.premium_client,
-        command.dataset,
-        command.symbol,
-        command.target_day,
-    )
+    try:
+        fallback = _refresh_premium_fallback(
+            command.request,
+            command.premium_client,
+            command.dataset,
+            command.symbol,
+            command.target_day,
+        )
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return ArchiveRefreshOutcome(
+            source=None,
+            failure=CollectorFailure(
+                dataset=command.dataset,
+                symbol=command.symbol,
+                interval=command.request.interval,
+                target_date=command.target_day.isoformat(),
+                source_url=PREMIUM_INDEX_KLINES_URL,
+                attempt_count=1,
+                error_code="premium_fallback_exception",
+                error_message=str(exc),
+                retryable=True,
+            ),
+            kline_path=None,
+        )
     if fallback is not None:
         return ArchiveRefreshOutcome(source=fallback, failure=None, kline_path=None)
     failure = (

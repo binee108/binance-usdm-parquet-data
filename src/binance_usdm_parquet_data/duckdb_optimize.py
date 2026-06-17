@@ -6,6 +6,7 @@ from typing import cast
 
 import duckdb
 
+from binance_usdm_parquet_data.locks import shared_file_lock
 from binance_usdm_parquet_data.paths import require_interval, require_symbol
 
 
@@ -29,17 +30,21 @@ def optimize_klines(
         / "candles.parquet"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(suffix=".parquet", dir=output.parent, delete=False) as handle:
-        temp_path = Path(handle.name)
-    interval_ms = _interval_ms(checked_interval)
-    file_paths = [path.as_posix() for path in raw_files]
-    with duckdb.connect(":memory:") as connection:
-        columns = _raw_columns(connection, file_paths)
-        query = _optimized_query(_trade_count_expr(columns))
-        params = [file_paths, interval_ms, interval_ms]
-        relation = connection.sql(query, params=params)
-        relation.write_parquet(temp_path.as_posix(), compression="zstd")
-    _ = temp_path.replace(output)
+    with shared_file_lock(output, "optimize_klines"):
+        with NamedTemporaryFile(suffix=".parquet", dir=output.parent, delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            interval_ms = _interval_ms(checked_interval)
+            file_paths = [path.as_posix() for path in raw_files]
+            with duckdb.connect(":memory:") as connection:
+                columns = _raw_columns(connection, file_paths)
+                query = _optimized_query(_trade_count_expr(columns))
+                params = [file_paths, interval_ms, interval_ms]
+                relation = connection.sql(query, params=params)
+                relation.write_parquet(temp_path.as_posix(), compression="zstd")
+            _ = temp_path.replace(output)
+        finally:
+            temp_path.unlink(missing_ok=True)
     return output
 
 

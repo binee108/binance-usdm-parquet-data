@@ -2,21 +2,28 @@ from __future__ import annotations
 
 import json
 import os
-import socket
-import time
 import uuid
-from collections.abc import Generator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Final, TypedDict, cast
 
+from binance_usdm_parquet_data.locks import (
+    DEFAULT_LOCK_POLL_SECONDS,
+    DEFAULT_LOCK_STALE_SECONDS,
+    DEFAULT_LOCK_WAIT_SECONDS,
+    LockOptions,
+    SharedFileLockTimeoutError,
+    SharedFileStaleLockError,
+    shared_file_lock,
+)
 from binance_usdm_parquet_data.paths import manifest_root
 from binance_usdm_parquet_data.records import MissingKlineRange
 
 MISSING_KLINES_FILENAME: Final = "missing_klines.jsonl"
-LOCK_WAIT_SECONDS: Final = 30.0
-LOCK_STALE_SECONDS: Final = 300.0
-LOCK_POLL_SECONDS: Final = 0.1
+LOCK_WAIT_SECONDS: Final = DEFAULT_LOCK_WAIT_SECONDS
+LOCK_STALE_SECONDS: Final = DEFAULT_LOCK_STALE_SECONDS
+LOCK_POLL_SECONDS: Final = DEFAULT_LOCK_POLL_SECONDS
+MissingKlinesLockTimeoutError = SharedFileLockTimeoutError
+MissingKlinesStaleLockError = SharedFileStaleLockError
 
 
 class MissingKlinePayload(TypedDict):
@@ -29,14 +36,6 @@ class MissingKlinePayload(TypedDict):
     observed_before_ts: int
     observed_after_ts: int
     reason: str
-
-
-class MissingKlinesLockTimeoutError(RuntimeError):
-    pass
-
-
-class MissingKlinesStaleLockError(RuntimeError):
-    pass
 
 
 def missing_klines_path(root: Path | None) -> Path:
@@ -61,7 +60,15 @@ def record_missing_klines(root: Path | None, ranges: list[MissingKlineRange]) ->
     if not ranges:
         return
     path = missing_klines_path(root)
-    with _missing_klines_lock(path):
+    with shared_file_lock(
+        path,
+        "record_missing_klines",
+        options=LockOptions(
+            wait_seconds=LOCK_WAIT_SECONDS,
+            stale_seconds=LOCK_STALE_SECONDS,
+            poll_seconds=LOCK_POLL_SECONDS,
+        ),
+    ):
         existing = {_payload_key(payload): payload for payload in read_missing_klines(root)}
         for missing_range in ranges:
             payload = _payload_from_range(missing_range)
@@ -96,96 +103,6 @@ def _payload_from_range(missing_range: MissingKlineRange) -> MissingKlinePayload
         "observed_after_ts": missing_range.observed_after_ts,
         "reason": missing_range.reason,
     }
-
-
-def _missing_lock_path(path: Path) -> Path:
-    return path.with_name(f".{path.name}.lock")
-
-
-@contextmanager
-def _missing_klines_lock(path: Path) -> Generator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _missing_lock_path(path)
-    owner_token = uuid.uuid4().hex
-    deadline = time.monotonic() + LOCK_WAIT_SECONDS
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            metadata = _read_lock_metadata(lock_path)
-            if _lock_is_stale(lock_path, metadata):
-                if metadata is not None and not _lock_targets_path(metadata, path):
-                    msg = f"stale missing klines lock targets a different file: {lock_path}"
-                    raise MissingKlinesStaleLockError(msg) from None
-                if _claim_stale_lock(lock_path):
-                    continue
-                continue
-            if time.monotonic() >= deadline:
-                msg = f"timed out waiting for lock: {lock_path}"
-                raise MissingKlinesLockTimeoutError(msg) from None
-            time.sleep(LOCK_POLL_SECONDS)
-            continue
-        else:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(_lock_metadata(path, owner_token), handle, sort_keys=True)
-                _ = handle.write("\n")
-            break
-    try:
-        yield
-    finally:
-        metadata = _read_lock_metadata(lock_path)
-        if metadata is None or metadata.get("owner_token") == owner_token:
-            lock_path.unlink(missing_ok=True)
-
-
-def _lock_metadata(path: Path, owner_token: str) -> dict[str, str | int | float]:
-    return {
-        "pid": os.getpid(),
-        "hostname": socket.gethostname(),
-        "created_at_epoch": time.time(),
-        "target_path": str(path.resolve()),
-        "operation": "record_missing_klines",
-        "owner_token": owner_token,
-    }
-
-
-def _claim_stale_lock(lock_path: Path) -> bool:
-    tombstone = lock_path.with_name(f".{lock_path.name}.{os.getpid()}.{uuid.uuid4().hex}.stale")
-    try:
-        _ = lock_path.replace(tombstone)
-    except FileNotFoundError:
-        return False
-    tombstone.unlink(missing_ok=True)
-    return True
-
-
-def _read_lock_metadata(path: Path) -> dict[str, str | int | float] | None:
-    try:
-        payload = cast("object", json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return {
-        str(key): value
-        for key, value in cast("dict[object, object]", payload).items()
-        if isinstance(value, str | int | float)
-    }
-
-
-def _lock_is_stale(path: Path, metadata: dict[str, str | int | float] | None) -> bool:
-    created_at = metadata.get("created_at_epoch") if metadata else None
-    if isinstance(created_at, int | float):
-        return time.time() - float(created_at) >= LOCK_STALE_SECONDS
-    try:
-        return time.time() - path.stat().st_mtime >= LOCK_STALE_SECONDS
-    except OSError:
-        return False
-
-
-def _lock_targets_path(metadata: dict[str, str | int | float], path: Path) -> bool:
-    target = metadata.get("target_path")
-    return isinstance(target, str) and target == str(path.resolve())
 
 
 def _payload_key(payload: MissingKlinePayload) -> tuple[str, str, int, int]:

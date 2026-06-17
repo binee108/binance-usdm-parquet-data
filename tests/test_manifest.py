@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import cast
 
+from binance_usdm_parquet_data.locks import default_lock_path, lock_metadata
 from binance_usdm_parquet_data.manifest import (
     CollectorFailure,
     CollectorRun,
@@ -112,3 +114,21 @@ def test_manifest_append_read_helpers_preserve_jsonl_and_status(
     assert read_failures(tmp_path) == (failure,)
     assert read_sources(tmp_path) == (source,)
     assert json.loads(status_path.read_text(encoding="utf-8")) == original_status
+
+
+def test_manifest_publish_claims_stale_status_lock(tmp_path: Path) -> None:
+    status_path = tmp_path / "manifests" / "binance" / "usdm" / "status.json"
+    lock_path = default_lock_path(status_path)
+    lock_path.parent.mkdir(parents=True)
+    metadata = lock_metadata(status_path, "publish_status", "stale-owner")
+    metadata["created_at_epoch"] = time.time() - 1_000
+    _ = lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    ManifestStore(tmp_path).publish_status(
+        last_run=None,
+        freshness=(),
+        failures=(),
+    )
+
+    assert json.loads(status_path.read_text(encoding="utf-8"))["status"] == "ok"
+    assert not lock_path.exists()

@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import cast
 
+from binance_usdm_parquet_data.locks import shared_file_lock
+
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 
@@ -82,15 +84,17 @@ class ManifestStore:
             "freshness": [_freshness_dict(item) for item in freshness],
             "failures": [_failure_dict(item) for item in failures],
         }
-        _atomic_write_json(self.manifest_root / "status.json", payload)
-        failure_lines = "".join(
-            json.dumps(_failure_dict(item), sort_keys=True) + "\n" for item in failures
-        )
-        _atomic_write_text(self.manifest_root / "failures.jsonl", failure_lines)
-        source_lines = "".join(
-            json.dumps(_source_dict(item), sort_keys=True) + "\n" for item in sources
-        )
-        _atomic_write_text(self.manifest_root / "sources.jsonl", source_lines)
+        status_path = self.manifest_root / "status.json"
+        with shared_file_lock(status_path, "publish_status"):
+            _atomic_write_json(status_path, payload)
+            failure_lines = "".join(
+                json.dumps(_failure_dict(item), sort_keys=True) + "\n" for item in failures
+            )
+            _atomic_write_text(self.manifest_root / "failures.jsonl", failure_lines)
+            source_lines = "".join(
+                json.dumps(_source_dict(item), sort_keys=True) + "\n" for item in sources
+            )
+            _atomic_write_text(self.manifest_root / "sources.jsonl", source_lines)
 
 
 def read_status(root: Path) -> JsonObject:
@@ -133,11 +137,10 @@ def read_failures(root: Path) -> tuple[CollectorFailure, ...]:
 
 
 def append_failure(root: Path, failure: CollectorFailure) -> None:
-    failures = (*read_failures(root), failure)
-    _atomic_write_jsonl(
-        _manifest_file(root, "failures.jsonl"),
-        [_failure_dict(item) for item in failures],
-    )
+    path = _manifest_file(root, "failures.jsonl")
+    with shared_file_lock(path, "append_failure"):
+        failures = (*read_failures(root), failure)
+        _atomic_write_jsonl(path, [_failure_dict(item) for item in failures])
 
 
 def read_sources(root: Path) -> tuple[CollectorSource, ...]:
@@ -146,11 +149,10 @@ def read_sources(root: Path) -> tuple[CollectorSource, ...]:
 
 
 def append_source(root: Path, source: CollectorSource) -> None:
-    sources = (*read_sources(root), source)
-    _atomic_write_jsonl(
-        _manifest_file(root, "sources.jsonl"),
-        [_source_dict(item) for item in sources],
-    )
+    path = _manifest_file(root, "sources.jsonl")
+    with shared_file_lock(path, "append_source"):
+        sources = (*read_sources(root), source)
+        _atomic_write_jsonl(path, [_source_dict(item) for item in sources])
 
 
 def _run_dict(run: CollectorRun) -> JsonObject:

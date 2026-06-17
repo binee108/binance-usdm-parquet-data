@@ -3,16 +3,21 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import time
 import zipfile
 from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import polars as pl
 
 from binance_usdm_parquet_data.archive_download import ArchiveHttpClient
 from binance_usdm_parquet_data.funding_rate import FundingRateClient, FundingRateRecord, JsonValue
+from binance_usdm_parquet_data.locks import lock_metadata
 from binance_usdm_parquet_data.refresh import RefreshRequest, refresh_market_data
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class FakeArchiveClient:
@@ -57,6 +62,13 @@ class EmptyPremiumClient:
     def get_json(self, url: str, params: dict[str, str]) -> JsonValue:
         del url, params
         return []
+
+
+class FailingPremiumClient:
+    def get_json(self, url: str, params: dict[str, str]) -> JsonValue:
+        del url, params
+        message = "premium api down"
+        raise OSError(message)
 
 
 class RecordingArchiveClient:
@@ -151,6 +163,36 @@ def test_refresh_records_archive_exception_as_item_failure(tmp_path: Path) -> No
     assert failures[0]["retryable"] is True
 
 
+def test_refresh_records_premium_rest_fallback_exception_as_item_failure(
+    tmp_path: Path,
+) -> None:
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("1000BTTCUSDT",),
+            start_day=date(2026, 6, 15),
+            end_day=date(2026, 6, 15),
+            datasets=("premiumIndexKlines",),
+            interval="1m",
+            optimize=False,
+        ),
+        archive_client=FailingArchiveClient(),
+        funding_client=FakeFundingClient(),
+        premium_client=FailingPremiumClient(),
+    )
+
+    assert result.status == "failed"
+    assert result.success_count == 0
+    assert result.failure_count == 1
+    status = cast(
+        dict[str, object],
+        json.loads((tmp_path / "manifests" / "binance" / "usdm" / "status.json").read_text()),
+    )
+    failures = cast("list[dict[str, object]]", status["failures"])
+    assert failures[0]["error_code"] == "premium_fallback_exception"
+    assert failures[0]["retryable"] is True
+
+
 def test_refresh_uses_premium_rest_fallback_when_archive_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -186,6 +228,61 @@ def test_refresh_uses_premium_rest_fallback_when_archive_is_missing(
     )
     assert status["failed_item_count"] == 0
     assert status["source_count"] == 1
+
+
+def test_refresh_claims_stale_shared_refresh_lock(tmp_path: Path) -> None:
+    refresh_marker = tmp_path / "manifests" / "binance" / "usdm" / "refresh.json"
+    lock_path = refresh_marker.with_name(".refresh.lock")
+    lock_path.parent.mkdir(parents=True)
+    metadata = lock_metadata(refresh_marker, "refresh_market_data", "stale-owner")
+    metadata["created_at_epoch"] = time.time() - 1_000
+    _ = lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("BTCUSDT",),
+            start_day=date(2026, 6, 9),
+            end_day=date(2026, 6, 9),
+            datasets=("klines",),
+            interval="1m",
+            optimize=False,
+        ),
+        archive_client=FailingArchiveClient(),
+        funding_client=FakeFundingClient(),
+    )
+
+    assert result.status == "failed"
+    assert not lock_path.exists()
+    assert (tmp_path / "manifests" / "binance" / "usdm" / "status.json").exists()
+
+
+def test_refresh_applies_funding_sleep_option(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("binance_usdm_parquet_data.refresh.sleep", sleep_calls.append)
+
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("BTCUSDT",),
+            start_day=date(2026, 6, 9),
+            end_day=date(2026, 6, 9),
+            datasets=("fundingRate",),
+            interval="1m",
+            optimize=False,
+            max_concurrent_downloads=7,
+            http_timeout_seconds=12.5,
+            funding_rest_sleep_seconds=0.25,
+        ),
+        archive_client=FailingArchiveClient(),
+        funding_client=FakeFundingClient(),
+    )
+
+    assert result.status == "succeeded"
+    assert sleep_calls == [0.25]
 
 
 def test_refresh_monthly_archive_downloads_each_month_once(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ class RawArchiveDataset(StrEnum):
     FUNDING_RATE = "fundingRate"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class InvalidMarketDataKeyError(ValueError):
     field: str
     value: str
