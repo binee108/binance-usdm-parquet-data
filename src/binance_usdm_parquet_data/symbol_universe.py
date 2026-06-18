@@ -57,7 +57,11 @@ def build_symbol_universe(
     }
     canonical = dataset_symbols[ArchiveDataset.KLINES]
     selected = sorted(
-        (symbol for symbol in canonical if _quote_asset(symbol, quote_assets) is not None),
+        (
+            symbol
+            for symbol in canonical
+            if symbol.isascii() and _quote_asset(symbol, quote_assets) is not None
+        ),
         key=lambda symbol: _symbol_sort_key(symbol, quote_assets),
     )
     return SymbolUniverse(

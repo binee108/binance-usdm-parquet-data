@@ -46,13 +46,13 @@ class FakeListingClient:
         return self._pages[prefix]
 
 
-def test_archive_first_universe_keeps_delisted_usdt_and_excludes_other_quotes() -> None:
+def test_archive_first_universe_keeps_delisted_usdt_without_other_quotes_or_non_ascii() -> None:
     client: ArchiveListingClient = FakeListingClient()
 
     universe = build_symbol_universe(client, quote_assets=("USDT",))
 
     symbols = [symbol.symbol for symbol in universe.symbols]
-    assert symbols == ["BTCUSDT", "DELISTEDUSDT", "ΩUSDT"]
+    assert symbols == ["BTCUSDT", "DELISTEDUSDT"]
     assert all(symbol.quote_asset == "USDT" for symbol in universe.symbols)
     delisted = next(symbol for symbol in universe.symbols if symbol.symbol == "DELISTEDUSDT")
     assert delisted.datasets[ArchiveDataset.KLINES] is True
@@ -68,7 +68,6 @@ def test_archive_universe_can_be_reconfigured_without_changing_default_scope() -
         "BTCUSDT",
         "BTCUSDC",
         "DELISTEDUSDT",
-        "ΩUSDT",
     ]
 
 
