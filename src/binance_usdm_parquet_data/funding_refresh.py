@@ -7,6 +7,8 @@ from pathlib import Path
 from time import sleep
 from typing import Final
 
+import httpx2
+
 from binance_usdm_parquet_data.archive_download import (
     ArchiveDownloadFailure,
     ArchiveHttpClient,
@@ -21,6 +23,7 @@ from binance_usdm_parquet_data.funding_rest import refresh_funding_rest_day
 from binance_usdm_parquet_data.manifest import CollectorFailure, CollectorSource
 
 DECEMBER: Final = 12
+_FUNDING_ARCHIVE_ERROR_TYPES = (OSError, ValueError, TypeError, RuntimeError, httpx2.HTTPError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +54,7 @@ def refresh_funding_rate(
     sources: list[CollectorSource] = []
     failures: list[CollectorFailure] = []
     archive_months = _archive_months(request)
-    archive_days = {
-        day
-        for month in archive_months
-        for day in _days(month, _month_end(month))
-    }
+    archive_days = {day for month in archive_months for day in _days(month, _month_end(month))}
     for month in archive_months:
         result = _refresh_monthly_archive(request, archive_client, month)
         match result:
@@ -110,7 +109,7 @@ def _refresh_monthly_archive(
     request: FundingRefreshRequest,
     archive_client: ArchiveHttpClient,
     month: date,
-) -> CollectorSource | CollectorFailure:
+) -> CollectorSource | CollectorFailure | None:
     month_key = month.strftime("%Y-%m")
     try:
         result = download_monthly_funding_rate_archive_to_parquet(
@@ -118,13 +117,20 @@ def _refresh_monthly_archive(
             FundingRateArchiveRequest(symbol=request.symbol, month=month_key),
             request.root,
         )
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+    except _FUNDING_ARCHIVE_ERROR_TYPES as exc:
+        if _is_missing_funding_archive_error(exc):
+            return None
         return _funding_archive_exception(request, month_key, exc)
     match result:
         case DownloadedArchiveFile():
             return _funding_archive_source(result, request.symbol, month_key)
         case ArchiveDownloadFailure():
             return _funding_archive_failure(result, request.symbol, month_key)
+
+
+def _is_missing_funding_archive_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "404" in message and "not found" in message
 
 
 def _refresh_rest_days(
@@ -156,6 +162,7 @@ def _refresh_rest_days(
         sources=tuple(sources),
         failures=tuple(failures),
     )
+
 
 def _funding_archive_source(
     source: DownloadedArchiveFile,

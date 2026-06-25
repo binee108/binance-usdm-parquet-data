@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import httpx2
+
 from binance_usdm_parquet_data.archive_download import (
     ArchiveDownloadFailure,
     ArchiveHttpClient,
@@ -19,6 +21,8 @@ from binance_usdm_parquet_data.premium_index import (
     PremiumIndexKlineClient,
     backfill_premium_index_klines,
 )
+
+_ARCHIVE_ERROR_TYPES = (OSError, ValueError, TypeError, RuntimeError, httpx2.HTTPError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,13 +70,17 @@ def refresh_archive_dataset(
             failure=None,
             kline_path=result.output_path if target.dataset == "klines" else None,
         )
+    if _is_missing_archive_result(result):
+        return ArchiveRefreshOutcome(source=None, failure=None, kline_path=None)
     try:
         fallback = _refresh_premium_fallback(
             config,
             premium_client,
             target,
         )
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+    except _ARCHIVE_ERROR_TYPES as exc:
+        if _is_missing_archive_error(exc):
+            return ArchiveRefreshOutcome(source=None, failure=None, kline_path=None)
         return ArchiveRefreshOutcome(
             source=None,
             failure=CollectorFailure(
@@ -102,7 +110,7 @@ def _refresh_archive_item(
     config: ArchiveRefreshConfig,
     archive_client: ArchiveHttpClient,
     target: ArchiveRefreshTarget,
-) -> DownloadedArchiveFile | ArchiveDownloadFailure | CollectorFailure:
+) -> DownloadedArchiveFile | ArchiveDownloadFailure | CollectorFailure | None:
     if config.archive_granularity not in {"daily", "monthly"}:
         msg = f"unsupported archive granularity: {config.archive_granularity}"
         raise ValueError(msg)
@@ -132,7 +140,9 @@ def _refresh_archive_item(
                 )
             case unreachable:
                 raise AssertionError(unreachable)
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+    except _ARCHIVE_ERROR_TYPES as exc:
+        if _is_missing_archive_error(exc):
+            return None
         return CollectorFailure(
             dataset=target.dataset,
             symbol=target.symbol,
@@ -144,6 +154,23 @@ def _refresh_archive_item(
             error_message=str(exc),
             retryable=True,
         )
+
+
+def _is_missing_archive_result(
+    result: DownloadedArchiveFile | ArchiveDownloadFailure | CollectorFailure | None,
+) -> bool:
+    if result is None:
+        return True
+    if isinstance(result, ArchiveDownloadFailure):
+        return result.error_code == "archive_not_found"
+    if isinstance(result, CollectorFailure):
+        return result.error_code == "archive_not_found"
+    return False
+
+
+def _is_missing_archive_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "404" in message and "not found" in message
 
 
 def _refresh_premium_fallback(

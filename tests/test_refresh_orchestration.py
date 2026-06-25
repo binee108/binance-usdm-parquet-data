@@ -38,6 +38,18 @@ class FailingArchiveClient:
         raise OSError(url)
 
 
+class MissingArchiveClient:
+    def get_bytes(self, url: str) -> bytes:
+        del url
+        message = "404 Not Found"
+        raise OSError(message)
+
+    def get_text(self, url: str) -> str:
+        del url
+        message = "404 Not Found"
+        raise OSError(message)
+
+
 class EmptyPremiumClient:
     def get_json(self, url: str, params: dict[str, str]) -> JsonValue:
         del url, params
@@ -89,6 +101,33 @@ def test_refresh_records_archive_exception_as_item_failure(tmp_path: Path) -> No
     failures = cast("list[dict[str, object]]", status["failures"])
     assert failures[0]["error_code"] == "archive_exception"
     assert failures[0]["retryable"] is True
+
+
+def test_refresh_skips_missing_archive_days_without_failing_batch(tmp_path: Path) -> None:
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("DELISTEDUSDT",),
+            start_day=date(2026, 6, 15),
+            end_day=date(2026, 6, 15),
+            datasets=("klines", "premiumIndexKlines"),
+            interval="1m",
+            optimize=False,
+        ),
+        archive_client=MissingArchiveClient(),
+        funding_client=FakeFundingClient(),
+        premium_client=FailingPremiumClient(),
+    )
+
+    assert result.status == "succeeded"
+    assert result.success_count == 0
+    assert result.failure_count == 0
+    status = cast(
+        dict[str, object],
+        json.loads((tmp_path / "manifests" / "binance" / "usdm" / "status.json").read_text()),
+    )
+    assert status["failed_item_count"] == 0
+    assert status["source_count"] == 0
 
 
 def test_refresh_records_premium_rest_fallback_exception_as_item_failure(

@@ -56,6 +56,35 @@ class FailingArchiveClient:
         raise OSError(url)
 
 
+class MissingFundingArchiveClient:
+    def get_bytes(self, url: str) -> bytes:
+        del url
+        message = "404 Not Found"
+        raise OSError(message)
+
+    def get_text(self, url: str) -> str:
+        del url
+        message = "404 Not Found"
+        raise OSError(message)
+
+
+class MissingFundingClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, int, int]] = []
+
+    def get_funding_rates(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int,
+    ) -> list[FundingRateRecord]:
+        self.calls.append((symbol, start_time_ms, end_time_ms, limit))
+        message = "400 Bad Request: Invalid symbol"
+        raise OSError(message)
+
+
 class FundingMonthlyArchiveClient:
     def __init__(self, archive: bytes) -> None:
         self.archive: bytes = archive
@@ -161,6 +190,35 @@ def test_refresh_applies_funding_sleep_option(
 
     assert result.status == "succeeded"
     assert sleep_calls == [0.25]
+
+
+def test_refresh_skips_missing_funding_for_delisted_symbol(tmp_path: Path) -> None:
+    funding_client = MissingFundingClient()
+
+    result = refresh_market_data(
+        RefreshRequest(
+            root=tmp_path,
+            symbols=("DELISTEDUSDT",),
+            start_day=date(2026, 6, 9),
+            end_day=date(2026, 6, 9),
+            datasets=("fundingRate",),
+            interval="1m",
+            optimize=False,
+        ),
+        archive_client=MissingFundingArchiveClient(),
+        funding_client=funding_client,
+    )
+
+    assert result.status == "succeeded"
+    assert result.success_count == 0
+    assert result.failure_count == 0
+    assert len(funding_client.calls) == 1
+    status = cast(
+        dict[str, object],
+        json.loads((tmp_path / "manifests" / "binance" / "usdm" / "status.json").read_text()),
+    )
+    assert status["failed_item_count"] == 0
+    assert status["source_count"] == 0
 
 
 def test_refresh_uses_monthly_funding_archive_for_complete_month(tmp_path: Path) -> None:
